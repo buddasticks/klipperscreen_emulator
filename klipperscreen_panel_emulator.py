@@ -27,7 +27,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any
 
 
@@ -437,7 +437,11 @@ class FakeKlippyActions:
         self._printer.state = "shutdown"
 
     def set_tool_temp(self, tool_number: int, temp: int) -> None:
-        tool_name = self._printer.get_tools()[tool_number]
+        tools = self._printer.get_tools()
+        if 0 <= tool_number < len(tools):
+            tool_name = tools[tool_number]
+        else:
+            tool_name = "extruder" if tool_number == 0 else f"extruder{tool_number}"
         self._printer.set_stat(tool_name, {"target": temp})
         self._log.add(f"[KLIPPY] set_tool_temp(tool={tool_number}, temp={temp})")
 
@@ -573,6 +577,8 @@ class EmulatorScreen(Gtk.Window):
         self.current_panel: Any = None
         self.panels: dict[str, Any] = {}
         self._cur_panels: list[str] = []
+        self.tool_numbers: list[int] = [0]
+        self.active_tool: int = 0
 
         self.set_default_size(width, height)
         self.connect("destroy", Gtk.main_quit)
@@ -608,7 +614,6 @@ class EmulatorScreen(Gtk.Window):
         self.show_panel(panel_name)
         self.show_all()
 
-
     def _init_temp_colors(self) -> None:
         self.gtk.color_list = {
             "extruder": {"colors": ["ff6b6b", "ff8e72", "ffb36b"], "state": 0},
@@ -618,6 +623,144 @@ class EmulatorScreen(Gtk.Window):
         }
         if hasattr(self.gtk, "reset_temp_color"):
             self.gtk.reset_temp_color()
+
+    def _tool_name_for_number(self, tool_number: int) -> str:
+        return "extruder" if tool_number == 0 else f"extruder{tool_number}"
+
+    def _discover_tool_numbers_from_state(self, state: dict[str, Any]) -> list[int]:
+        found: set[int] = set()
+
+        for section_name in ("config", "data"):
+            section = state.get(section_name, {})
+            if not isinstance(section, dict):
+                continue
+
+            tc = section.get("toolchanger", {})
+            if isinstance(tc, dict):
+                for value in tc.get("tool_numbers", []):
+                    try:
+                        found.add(int(value))
+                    except (TypeError, ValueError):
+                        pass
+
+            for key in section.keys():
+                if key == "extruder":
+                    found.add(0)
+                    continue
+
+                match = re.fullmatch(r"extruder(\d+)", key)
+                if match:
+                    found.add(int(match.group(1)))
+                    continue
+
+                match = re.fullmatch(r"tool T(\d+)", key)
+                if match:
+                    found.add(int(match.group(1)))
+
+        return sorted(found) or [0]
+
+    def _ensure_tooling_state(
+        self,
+        config: dict[str, Any],
+        data: dict[str, Any],
+        tool_numbers: list[int],
+    ) -> None:
+        config.setdefault("toolchanger", {})
+        data.setdefault("toolchanger", {})
+
+        existing: list[int] = []
+        for value in data["toolchanger"].get("tool_numbers", []):
+            try:
+                existing.append(int(value))
+            except (TypeError, ValueError):
+                pass
+
+        tool_numbers = sorted(set(tool_numbers) | set(existing)) or [0]
+
+        extruder_config_template = {
+            "max_temp": "300",
+            "min_extrude_temp": "170",
+            "control": "pid",
+        }
+        extruder_data_template = {
+            "temperature": 25.0,
+            "target": 0.0,
+            "power": 0.0,
+        }
+        tool_config_template = {
+            "gcode_x_offset": "0.0",
+            "gcode_y_offset": "0.0",
+            "gcode_z_offset": "0.0",
+        }
+        tool_data_template = {
+            "gcode_x_offset": 0.0,
+            "gcode_y_offset": 0.0,
+            "gcode_z_offset": 0.0,
+        }
+
+        for tool_number in tool_numbers:
+            tool_name = self._tool_name_for_number(tool_number)
+            config.setdefault(tool_name, dict(extruder_config_template))
+            data.setdefault(tool_name, dict(extruder_data_template))
+
+            tool_key = f"tool T{tool_number}"
+            config.setdefault(tool_key, dict(tool_config_template))
+            data.setdefault(tool_key, dict(tool_data_template))
+
+        data["toolchanger"]["tool_numbers"] = tool_numbers
+
+        try:
+            active_tool = int(data["toolchanger"].get("tool_number", tool_numbers[0]))
+        except (TypeError, ValueError):
+            active_tool = tool_numbers[0]
+
+        if active_tool not in tool_numbers:
+            active_tool = tool_numbers[0]
+
+        data["toolchanger"]["tool_number"] = active_tool
+        self.tool_numbers = tool_numbers
+        self.active_tool = active_tool
+
+    def _sync_tool_widgets_from_printer(self) -> None:
+        if not hasattr(self, "tool_combo"):
+            return
+
+        tc = self.printer.get_stat("toolchanger") or {}
+        raw_tool_numbers = tc.get("tool_numbers", self.tool_numbers or [0])
+
+        tool_numbers: list[int] = []
+        for value in raw_tool_numbers:
+            try:
+                tool_numbers.append(int(value))
+            except (TypeError, ValueError):
+                pass
+
+        self.tool_numbers = sorted(set(tool_numbers)) or [0]
+
+        try:
+            active_tool = int(tc.get("tool_number", self.active_tool))
+        except (TypeError, ValueError):
+            active_tool = self.tool_numbers[0]
+
+        if active_tool not in self.tool_numbers:
+            active_tool = self.tool_numbers[0]
+
+        self.active_tool = active_tool
+
+        self.tool_combo.handler_block(self.tool_combo_handler_id)
+        self.tool_combo.remove_all()
+        for tool_number in self.tool_numbers:
+            self.tool_combo.append(str(tool_number), f"T{tool_number}")
+        self.tool_combo.set_active_id(str(self.active_tool))
+        self.tool_combo.handler_unblock(self.tool_combo_handler_id)
+
+        tool_name = self._tool_name_for_number(self.active_tool)
+        self.extruder_temp.set_value(
+            float(self.printer.get_stat(tool_name, "temperature") or 0)
+        )
+        self.bed_temp.set_value(
+            float(self.printer.get_stat("heater_bed", "temperature") or 0)
+        )
 
     def show_keyboard(self, *args: Any) -> bool:
         self.action_log.add("[EMU] show_keyboard()")
@@ -681,14 +824,21 @@ class EmulatorScreen(Gtk.Window):
         box.pack_start(Gtk.Label(label="Printer state", xalign=0), False, False, 0)
         box.pack_start(self.state_combo, False, False, 0)
 
+        box.pack_start(Gtk.Label(label="Active tool", xalign=0), False, False, 0)
+        self.tool_combo = Gtk.ComboBoxText()
+        self.tool_combo.append("0", "T0")
+        self.tool_combo.set_active_id("0")
+        self.tool_combo_handler_id = self.tool_combo.connect("changed", self._on_tool_changed)
+        box.pack_start(self.tool_combo, False, False, 0)
+
         temp_row = Gtk.Box(spacing=6)
         self.extruder_temp = Gtk.SpinButton.new_with_range(0, 320, 1)
         self.extruder_temp.set_value(212)
         self.bed_temp = Gtk.SpinButton.new_with_range(0, 150, 1)
         self.bed_temp.set_value(60)
-        temp_row.pack_start(Gtk.Label(label="E", xalign=0), False, False, 0)
+        temp_row.pack_start(Gtk.Label(label="Tool", xalign=0), False, False, 0)
         temp_row.pack_start(self.extruder_temp, True, True, 0)
-        temp_row.pack_start(Gtk.Label(label="B", xalign=0), False, False, 0)
+        temp_row.pack_start(Gtk.Label(label="Bed", xalign=0), False, False, 0)
         temp_row.pack_start(self.bed_temp, True, True, 0)
         box.pack_start(Gtk.Label(label="Temperatures", xalign=0), False, False, 0)
         box.pack_start(temp_row, False, False, 0)
@@ -742,6 +892,13 @@ class EmulatorScreen(Gtk.Window):
     def load_state(self, state: dict[str, Any]) -> None:
         config = deep_merge(DEFAULT_STATE["config"], state.get("config", {}))
         data = deep_merge(DEFAULT_STATE["data"], state.get("data", {}))
+
+        tool_numbers = self._discover_tool_numbers_from_state({
+            "config": config,
+            "data": data,
+        })
+        self._ensure_tooling_state(config, data, tool_numbers)
+
         data.setdefault("configfile", {})["config"] = config
 
         printer_info = {"software_version": "KlipperScreen Emulator"}
@@ -749,6 +906,8 @@ class EmulatorScreen(Gtk.Window):
         self.printer.configure_power_devices({"devices": state.get("power_devices", DEFAULT_STATE["power_devices"])})
         self.printer.configure_cameras(state.get("cameras", DEFAULT_STATE["cameras"]))
         self.server_info = state.get("server_info", DEFAULT_STATE["server_info"])
+
+        self._sync_tool_widgets_from_printer()
         self.action_log.add("[EMU] State loaded")
 
     def init_tempstore(self) -> None:
@@ -768,6 +927,23 @@ class EmulatorScreen(Gtk.Window):
         self.action_log.add("[EMU] Temp store initialized")
 
     def _state_json_from_widgets(self) -> dict[str, Any]:
+        active_id = self.tool_combo.get_active_id() if hasattr(self, "tool_combo") else None
+        if active_id is not None:
+            self.active_tool = int(active_id)
+
+        tool_name = self._tool_name_for_number(self.active_tool)
+        tool_numbers = self.printer.get_stat("toolchanger", "tool_numbers") or self.tool_numbers or [0]
+
+        normalized_tool_numbers: list[int] = []
+        for value in tool_numbers:
+            try:
+                normalized_tool_numbers.append(int(value))
+            except (TypeError, ValueError):
+                pass
+
+        if not normalized_tool_numbers:
+            normalized_tool_numbers = [self.active_tool]
+
         state = {
             "data": {
                 "webhooks": {"state": self.state_combo.get_active_id() or "ready"},
@@ -780,7 +956,11 @@ class EmulatorScreen(Gtk.Window):
                         "error": "error",
                     }[self.state_combo.get_active_id() or "ready"]
                 },
-                "extruder": {"temperature": self.extruder_temp.get_value()},
+                "toolchanger": {
+                    "tool_number": self.active_tool,
+                    "tool_numbers": normalized_tool_numbers,
+                },
+                tool_name: {"temperature": self.extruder_temp.get_value()},
                 "heater_bed": {"temperature": self.bed_temp.get_value()},
                 "pause_resume": {"is_paused": (self.state_combo.get_active_id() == "paused")},
             }
@@ -791,6 +971,7 @@ class EmulatorScreen(Gtk.Window):
         patch = self._state_json_from_widgets()
         self.printer.process_update(patch["data"])
         self.printer.state = self.printer.evaluate_state()
+        self._sync_tool_widgets_from_printer()
 
     def _push_status_update(self, *_args: Any) -> None:
         self._apply_widget_state()
@@ -803,6 +984,25 @@ class EmulatorScreen(Gtk.Window):
         self.base_panel.set_status(f"state: {self.printer.state}")
         if hasattr(self.current_panel, "process_update"):
             self.current_panel.process_update("notify_status_update", self.printer.data)
+
+    def _on_tool_changed(self, *_args: Any) -> None:
+        active_id = self.tool_combo.get_active_id()
+        if active_id is None:
+            return
+
+        self.active_tool = int(active_id)
+
+        current_tc = dict(self.printer.get_stat("toolchanger") or {})
+        current_tc["tool_number"] = self.active_tool
+        current_tc["tool_numbers"] = self.tool_numbers or [self.active_tool]
+        self.printer.set_stat("toolchanger", current_tc)
+
+        tool_name = self._tool_name_for_number(self.active_tool)
+        self.extruder_temp.set_value(
+            float(self.printer.get_stat(tool_name, "temperature") or 0)
+        )
+
+        self._notify_current_panel()
 
     def _on_load_panel(self, *_args: Any) -> None:
         self.show_panel(self.panel_entry.get_text().strip() or self.panel_name)
@@ -876,6 +1076,7 @@ class EmulatorScreen(Gtk.Window):
         self.printer.set_stat("toolhead", {"position": position[:]})
 
     def _notify_current_panel(self) -> None:
+        self._sync_tool_widgets_from_printer()
         if hasattr(self.current_panel, "process_update"):
             self.current_panel.process_update("notify_status_update", self.printer.data)
 
@@ -895,7 +1096,25 @@ class EmulatorScreen(Gtk.Window):
                 continue
             tool_match = re.fullmatch(r"T(\d+)", line, flags=re.IGNORECASE)
             if tool_match:
-                self.printer.set_stat("toolchanger", {"tool_number": int(tool_match.group(1))})
+                new_tool = int(tool_match.group(1))
+                current_tc = dict(self.printer.get_stat("toolchanger") or {})
+                tool_numbers = current_tc.get("tool_numbers", self.tool_numbers or [0])
+
+                normalized: list[int] = []
+                for value in tool_numbers:
+                    try:
+                        normalized.append(int(value))
+                    except (TypeError, ValueError):
+                        pass
+
+                if new_tool not in normalized:
+                    normalized.append(new_tool)
+                    normalized.sort()
+
+                self.printer.set_stat("toolchanger", {
+                    "tool_number": new_tool,
+                    "tool_numbers": normalized,
+                })
                 continue
             upper = line.upper()
             if upper == "G91":
